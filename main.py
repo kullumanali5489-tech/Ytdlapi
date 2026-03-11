@@ -3,7 +3,6 @@ from flask_cors import CORS
 import yt_dlp
 import os
 import logging
-from pathlib import Path
 
 # ============================================================
 #   YouTube Downloader - Railway Edition
@@ -26,7 +25,6 @@ class QuietLogger:
     def error(self, msg): logger.error(f"❌ {msg}")
 
 def base_ydl_opts():
-    """Base yt-dlp options with cookies and spoofed headers"""
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -40,19 +38,17 @@ def base_ydl_opts():
         'retries': 3,
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv_embedded', 'ios'],
+                'player_client': ['tv_embedded', 'ios', 'web'],
             }
         },
     }
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
-        logger.info("🍪 Using cookies.txt")
-    else:
-        logger.warning("⚠️  cookies.txt not found — may get bot-detected")
     return opts
 
+
 def get_video_info(url):
-    """Get video info and available qualities with direct CDN URLs"""
+    """Get video info — collects ALL formats including combined video+audio"""
     ydl_opts = base_ydl_opts()
 
     try:
@@ -61,33 +57,48 @@ def get_video_info(url):
 
             seen_qualities = {}
 
-            if 'formats' in info:
-                # Video formats
-                for f in info['formats']:
-                    if f.get('height') and f.get('vcodec') != 'none' and f.get('url'):
-                        quality = f'{f["height"]}p'
-                        if quality not in seen_qualities or f.get('filesize', 0) > seen_qualities[quality].get('filesize', 0):
-                            seen_qualities[quality] = {
-                                'quality': quality,
-                                'height': f['height'],
-                                'ext': f.get('ext', 'mp4'),
-                                'filesize': f.get('filesize', 0),
-                                'direct_url': f['url'],
-                                'format_note': f.get('format_note', ''),
-                                'fps': f.get('fps', 0)
-                            }
+            for f in info.get('formats', []):
+                direct_url = f.get('url')
+                if not direct_url:
+                    continue
 
-                # Audio formats
-                for f in info['formats']:
-                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url'):
-                        if 'audio' not in seen_qualities or f.get('abr', 0) > seen_qualities.get('audio', {}).get('abr', 0):
-                            seen_qualities['audio'] = {
-                                'quality': 'audio',
-                                'ext': f.get('ext', 'm4a'),
-                                'filesize': f.get('filesize', 0),
-                                'direct_url': f['url'],
-                                'abr': f.get('abr', 0)
-                            }
+                height = f.get('height')
+                vcodec = f.get('vcodec', 'none')
+                acodec = f.get('acodec', 'none')
+
+                # Audio only
+                if acodec != 'none' and vcodec == 'none':
+                    key = 'audio'
+                    if key not in seen_qualities or f.get('abr', 0) > seen_qualities[key].get('abr', 0):
+                        seen_qualities[key] = {
+                            'quality': 'audio',
+                            'ext': f.get('ext', 'm4a'),
+                            'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                            'direct_url': direct_url,
+                            'abr': f.get('abr', 0),
+                            'height': 0,
+                        }
+
+                # Video (with or without audio — tv_embedded gives combined)
+                elif vcodec != 'none' and height:
+                    key = f'{height}p'
+                    existing = seen_qualities.get(key)
+                    # Prefer formats that have audio included (combined)
+                    has_audio = acodec != 'none'
+                    existing_has_audio = existing and existing.get('has_audio', False)
+
+                    if not existing or (has_audio and not existing_has_audio) or \
+                       (has_audio == existing_has_audio and
+                        (f.get('filesize') or 0) > (existing.get('filesize') or 0)):
+                        seen_qualities[key] = {
+                            'quality': key,
+                            'height': height,
+                            'ext': f.get('ext', 'mp4'),
+                            'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                            'direct_url': direct_url,
+                            'has_audio': has_audio,
+                            'fps': f.get('fps', 0),
+                        }
 
             formats = list(seen_qualities.values())
             formats.sort(key=lambda x: x.get('height', 0), reverse=True)
@@ -99,10 +110,42 @@ def get_video_info(url):
                 'thumbnail': info.get('thumbnail', ''),
                 'uploader': info.get('uploader', 'Unknown'),
                 'view_count': info.get('view_count', 0),
-                'formats': formats
+                'formats': formats,
             }
     except Exception as e:
         return {'success': False, 'error': str(e)}
+
+
+def find_best_match(formats_dict, requested_quality):
+    """Find exact match or closest lower quality"""
+    if requested_quality in formats_dict:
+        return formats_dict[requested_quality]
+
+    # Try to find closest available quality
+    if requested_quality == 'audio':
+        return None
+
+    try:
+        requested_height = int(requested_quality.replace('p', ''))
+    except ValueError:
+        return None
+
+    # Get all video qualities sorted descending
+    video_qualities = sorted(
+        [(int(k.replace('p', '')), v) for k, v in formats_dict.items() if k != 'audio'],
+        reverse=True
+    )
+
+    # Find closest quality at or below requested
+    for height, fmt in video_qualities:
+        if height <= requested_height:
+            return fmt
+
+    # If nothing lower, return lowest available
+    if video_qualities:
+        return video_qualities[-1][1]
+
+    return None
 
 
 @app.route('/', methods=['GET'])
@@ -127,19 +170,19 @@ def home():
         <div class="section">
             <h3>Step 1 — Get available qualities</h3>
             <code>/dl?url=VIDEO_URL</code>
-            <p class="label">Returns JSON with title, formats, and direct CDN URLs</p>
         </div>
 
         <div class="section">
-            <h3>Step 2 — Download with quality</h3>
+            <h3>Step 2 — Download</h3>
             <code>/dl?url=VIDEO_URL&q=QUALITY</code>
-            <p class="label">Redirects your browser directly to YouTube's CDN. Nothing stored here.</p>
+            <p class="label">Redirects directly to YouTube CDN. Nothing stored here.</p>
         </div>
 
         <div class="section">
             <h3>Quality options</h3>
-            <code>1080p</code> &nbsp; <code>720p</code> &nbsp; <code>480p</code> &nbsp;
-            <code>360p</code> &nbsp; <code>240p</code> &nbsp; <code>audio</code>
+            <code>1080p</code> &nbsp;<code>720p</code> &nbsp;<code>480p</code> &nbsp;
+            <code>360p</code> &nbsp;<code>240p</code> &nbsp;<code>audio</code>
+            <p class="label">If exact quality unavailable, closest lower quality is used automatically.</p>
         </div>
 
         <div class="section">
@@ -157,10 +200,6 @@ def home():
 
 @app.route('/dl', methods=['GET'])
 def download_direct():
-    """
-    No q param  → return JSON with available qualities + direct URLs
-    With q param → redirect browser straight to YouTube CDN (nothing stored on server)
-    """
     url = request.args.get('url')
     quality = request.args.get('q')
 
@@ -170,11 +209,10 @@ def download_direct():
     logger.info(f"{'📋 Info' if not quality else f'🔗 Redirect [{quality}]'}: {url}")
 
     info = get_video_info(url)
-
     if not info['success']:
         return jsonify(info), 400
 
-    # No quality specified — return info JSON
+    # No quality — return JSON info
     if not quality:
         duration = info['duration']
         return jsonify({
@@ -187,33 +225,32 @@ def download_direct():
             'formats': info['formats'],
             'usage': f"/dl?url={url}&q=QUALITY",
             'example': f"/dl?url={url}&q=720p",
-            'note': 'Use the direct_url from formats, or add &q=QUALITY to redirect'
         })
 
-    # Quality specified — find matching format and redirect
-    formats = {f['quality']: f for f in info['formats']}
-    chosen = formats.get(quality)
+    # Quality specified — find best match and redirect
+    formats_dict = {f['quality']: f for f in info['formats']}
+    chosen = find_best_match(formats_dict, quality)
 
     if not chosen:
         return jsonify({
-            'error': f'Quality "{quality}" not available',
-            'available': list(formats.keys())
+            'error': f'No suitable format found for "{quality}"',
+            'available': list(formats_dict.keys())
         }), 400
 
-    direct_url = chosen['direct_url']
-    logger.info(f"✅ Redirecting to CDN for: {info['title']} [{quality}]")
+    actual_quality = chosen['quality']
+    if actual_quality != quality:
+        logger.info(f"⚠️  Requested {quality}, serving closest: {actual_quality}")
 
-    # 302 redirect — user downloads directly from YouTube's servers
-    # Railway never touches the file
-    return redirect(direct_url, code=302)
+    logger.info(f"✅ Redirecting → {info['title']} [{actual_quality}]")
+    return redirect(chosen['direct_url'], code=302)
 
 
 @app.route('/info', methods=['GET'])
 def info_only():
-    """Alias for /dl without q param"""
     url = request.args.get('url')
     if not url:
         return jsonify({'error': 'Missing url parameter'}), 400
+    request.args = request.args.copy()
     return download_direct()
 
 
@@ -223,9 +260,7 @@ if __name__ == '__main__':
     print("  🎬 YouTube Downloader - Railway Edition")
     print("  Developed by @Hellfirez3643")
     print("=" * 60)
-    print(f"  🌐 Running on port {port}")
+    print(f"  🌐 Port: {port}")
     print(f"  🍪 Cookies: {'✅ Found' if os.path.exists(COOKIES_FILE) else '❌ Not found'}")
-    print(f"  📦 Zero storage — pure CDN redirect mode")
     print("=" * 60 + "\n")
-
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
