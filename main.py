@@ -35,14 +35,12 @@ def base_ydl_opts():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
-        # Fix for "page needs to be reloaded" error
-        'extractor_retries': 5,
-        'retries': 5,
-        'sleep_interval_requests': 1,
+        # tv_embedded + ios bypass PO token requirement on datacenter IPs
+        'extractor_retries': 3,
+        'retries': 3,
         'extractor_args': {
             'youtube': {
-                'player_client': ['web', 'android'],
-                'skip': ['hls', 'dash'],
+                'player_client': ['tv_embedded', 'ios'],
             }
         },
     }
