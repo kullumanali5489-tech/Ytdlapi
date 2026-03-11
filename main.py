@@ -35,6 +35,16 @@ def base_ydl_opts():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
+        # Fix for "page needs to be reloaded" error
+        'extractor_retries': 5,
+        'retries': 5,
+        'sleep_interval_requests': 1,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'android'],
+                'skip': ['hls', 'dash'],
+            }
+        },
     }
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
