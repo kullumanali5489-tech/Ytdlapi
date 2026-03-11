@@ -24,21 +24,30 @@ class QuietLogger:
     def warning(self, msg): pass
     def error(self, msg): logger.error(f"❌ {msg}")
 
-def base_ydl_opts():
+# Each client to try in order — if one fails, next is attempted
+PLAYER_CLIENTS = [
+    ['mweb'],
+    ['tv_embedded'],
+    ['ios'],
+    ['android'],
+    ['web_creator'],
+]
+
+def make_ydl_opts(clients):
     opts = {
         'quiet': True,
         'no_warnings': True,
         'logger': QuietLogger(),
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
-        # tv_embedded + ios bypass PO token requirement on datacenter IPs
-        'extractor_retries': 3,
-        'retries': 3,
+        'extractor_retries': 2,
+        'retries': 2,
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv_embedded', 'ios', 'web'],
+                'player_client': clients,
+                'player_skip': ['webpage', 'js'],  # skip slow player fetches
             }
         },
     }
@@ -48,80 +57,91 @@ def base_ydl_opts():
 
 
 def get_video_info(url):
-    """Get video info — collects ALL formats including combined video+audio"""
-    ydl_opts = base_ydl_opts()
+    """Try each client until one works"""
+    last_error = None
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    for clients in PLAYER_CLIENTS:
+        try:
+            logger.info(f"🔄 Trying client: {clients}")
+            ydl_opts = make_ydl_opts(clients)
 
-            seen_qualities = {}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-            for f in info.get('formats', []):
-                direct_url = f.get('url')
-                if not direct_url:
+                seen_qualities = {}
+
+                for f in info.get('formats', []):
+                    direct_url = f.get('url')
+                    if not direct_url:
+                        continue
+
+                    height = f.get('height')
+                    vcodec = f.get('vcodec', 'none')
+                    acodec = f.get('acodec', 'none')
+
+                    # Audio only
+                    if acodec != 'none' and vcodec == 'none':
+                        key = 'audio'
+                        if key not in seen_qualities or f.get('abr', 0) > seen_qualities[key].get('abr', 0):
+                            seen_qualities[key] = {
+                                'quality': 'audio',
+                                'ext': f.get('ext', 'm4a'),
+                                'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                                'direct_url': direct_url,
+                                'abr': f.get('abr', 0),
+                                'height': 0,
+                            }
+
+                    # Video
+                    elif vcodec != 'none' and height:
+                        key = f'{height}p'
+                        existing = seen_qualities.get(key)
+                        has_audio = acodec != 'none'
+                        existing_has_audio = existing and existing.get('has_audio', False)
+
+                        if not existing or (has_audio and not existing_has_audio) or \
+                           (has_audio == existing_has_audio and
+                                (f.get('filesize') or 0) > (existing.get('filesize') or 0)):
+                            seen_qualities[key] = {
+                                'quality': key,
+                                'height': height,
+                                'ext': f.get('ext', 'mp4'),
+                                'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                                'direct_url': direct_url,
+                                'has_audio': has_audio,
+                                'fps': f.get('fps', 0),
+                            }
+
+                if not seen_qualities:
+                    last_error = "No formats found"
                     continue
 
-                height = f.get('height')
-                vcodec = f.get('vcodec', 'none')
-                acodec = f.get('acodec', 'none')
+                formats = list(seen_qualities.values())
+                formats.sort(key=lambda x: x.get('height', 0), reverse=True)
 
-                # Audio only
-                if acodec != 'none' and vcodec == 'none':
-                    key = 'audio'
-                    if key not in seen_qualities or f.get('abr', 0) > seen_qualities[key].get('abr', 0):
-                        seen_qualities[key] = {
-                            'quality': 'audio',
-                            'ext': f.get('ext', 'm4a'),
-                            'filesize': f.get('filesize') or f.get('filesize_approx', 0),
-                            'direct_url': direct_url,
-                            'abr': f.get('abr', 0),
-                            'height': 0,
-                        }
+                logger.info(f"✅ Success with client: {clients}")
+                return {
+                    'success': True,
+                    'title': info.get('title', 'Unknown'),
+                    'duration': info.get('duration', 0),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'uploader': info.get('uploader', 'Unknown'),
+                    'view_count': info.get('view_count', 0),
+                    'formats': formats,
+                }
 
-                # Video (with or without audio — tv_embedded gives combined)
-                elif vcodec != 'none' and height:
-                    key = f'{height}p'
-                    existing = seen_qualities.get(key)
-                    # Prefer formats that have audio included (combined)
-                    has_audio = acodec != 'none'
-                    existing_has_audio = existing and existing.get('has_audio', False)
+        except Exception as e:
+            last_error = str(e)
+            logger.info(f"⚠️  Client {clients} failed: {last_error[:80]}")
+            continue
 
-                    if not existing or (has_audio and not existing_has_audio) or \
-                       (has_audio == existing_has_audio and
-                        (f.get('filesize') or 0) > (existing.get('filesize') or 0)):
-                        seen_qualities[key] = {
-                            'quality': key,
-                            'height': height,
-                            'ext': f.get('ext', 'mp4'),
-                            'filesize': f.get('filesize') or f.get('filesize_approx', 0),
-                            'direct_url': direct_url,
-                            'has_audio': has_audio,
-                            'fps': f.get('fps', 0),
-                        }
-
-            formats = list(seen_qualities.values())
-            formats.sort(key=lambda x: x.get('height', 0), reverse=True)
-
-            return {
-                'success': True,
-                'title': info.get('title', 'Unknown'),
-                'duration': info.get('duration', 0),
-                'thumbnail': info.get('thumbnail', ''),
-                'uploader': info.get('uploader', 'Unknown'),
-                'view_count': info.get('view_count', 0),
-                'formats': formats,
-            }
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
+    return {'success': False, 'error': last_error or 'All clients failed'}
 
 
 def find_best_match(formats_dict, requested_quality):
-    """Find exact match or closest lower quality"""
     if requested_quality in formats_dict:
         return formats_dict[requested_quality]
 
-    # Try to find closest available quality
     if requested_quality == 'audio':
         return None
 
@@ -130,18 +150,15 @@ def find_best_match(formats_dict, requested_quality):
     except ValueError:
         return None
 
-    # Get all video qualities sorted descending
     video_qualities = sorted(
         [(int(k.replace('p', '')), v) for k, v in formats_dict.items() if k != 'audio'],
         reverse=True
     )
 
-    # Find closest quality at or below requested
     for height, fmt in video_qualities:
         if height <= requested_height:
             return fmt
 
-    # If nothing lower, return lowest available
     if video_qualities:
         return video_qualities[-1][1]
 
@@ -185,13 +202,6 @@ def home():
             <p class="label">If exact quality unavailable, closest lower quality is used automatically.</p>
         </div>
 
-        <div class="section">
-            <h3>Examples</h3>
-            <p>Get info: <code>/dl?url=https://youtube.com/watch?v=xyz</code></p>
-            <p>Download 720p: <code>/dl?url=https://youtube.com/watch?v=xyz&q=720p</code></p>
-            <p>Download audio: <code>/dl?url=https://youtube.com/watch?v=xyz&q=audio</code></p>
-        </div>
-
         <footer>Developed by @Hellfirez3643</footer>
     </body>
     </html>
@@ -206,13 +216,12 @@ def download_direct():
     if not url:
         return jsonify({'error': 'Missing url parameter. Usage: /dl?url=VIDEO_URL'}), 400
 
-    logger.info(f"{'📋 Info' if not quality else f'🔗 Redirect [{quality}]'}: {url}")
+    logger.info(f"{'📋 Info' if not quality else f'🔗 [{quality}]'}: {url}")
 
     info = get_video_info(url)
     if not info['success']:
         return jsonify(info), 400
 
-    # No quality — return JSON info
     if not quality:
         duration = info['duration']
         return jsonify({
@@ -227,7 +236,6 @@ def download_direct():
             'example': f"/dl?url={url}&q=720p",
         })
 
-    # Quality specified — find best match and redirect
     formats_dict = {f['quality']: f for f in info['formats']}
     chosen = find_best_match(formats_dict, quality)
 
@@ -243,15 +251,6 @@ def download_direct():
 
     logger.info(f"✅ Redirecting → {info['title']} [{actual_quality}]")
     return redirect(chosen['direct_url'], code=302)
-
-
-@app.route('/info', methods=['GET'])
-def info_only():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({'error': 'Missing url parameter'}), 400
-    request.args = request.args.copy()
-    return download_direct()
 
 
 if __name__ == '__main__':
